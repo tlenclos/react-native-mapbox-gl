@@ -14,6 +14,7 @@ import android.widget.FrameLayout;
 import android.widget.RelativeLayout;
 
 import com.facebook.react.bridge.Arguments;
+import com.facebook.react.bridge.JSApplicationIllegalArgumentException;
 import com.facebook.react.bridge.LifecycleEventListener;
 import com.facebook.react.bridge.ReactContext;
 import com.facebook.react.bridge.WritableMap;
@@ -35,8 +36,10 @@ import com.mapbox.mapboxsdk.maps.OnMapReadyCallback;
 import com.mapbox.mapboxsdk.maps.UiSettings;
 
 import java.util.Collection;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
@@ -48,7 +51,7 @@ public class ReactNativeMapboxGLView extends RelativeLayout implements
         MapboxMap.OnMyBearingTrackingModeChangeListener, MapboxMap.OnMyLocationTrackingModeChangeListener,
         MapboxMap.OnMyLocationChangeListener,
         MapboxMap.OnMarkerClickListener, MapboxMap.OnInfoWindowClickListener,
-        MapView.OnMapChangedListener, ReactNativeMapboxGLManager.ChildListener
+        MapView.OnMapChangedListener
 {
 
     private MapboxMap _map = null;
@@ -77,6 +80,8 @@ public class ReactNativeMapboxGLView extends RelativeLayout implements
     private boolean _didChangeThrottled = false;
     private boolean _changeWasAnimated = false;
 
+    private Set<RNMGLAnnotationView> _annotationViews = new HashSet<>();
+    private List<View> _childViews = new ArrayList<View>();
     private Map<String, Annotation> _annotations = new HashMap<>();
     private Map<Long, String> _annotationIdsToName = new HashMap<>();
     private Map<String, RNMGLAnnotationOptions> _annotationOptions = new HashMap<>();
@@ -85,7 +90,8 @@ public class ReactNativeMapboxGLView extends RelativeLayout implements
     private Map<RNMGLAnnotationView, RNMGLAnnotationView.PropertyListener> _propertyListeners = new HashMap<>();
 
     private Handler _handler;
-
+    private boolean _mapIsLoading = false;
+    private boolean _mapLoaded = false;
 
     @UiThread
     public ReactNativeMapboxGLView(Context context, ReactNativeMapboxGLManager manager) {
@@ -112,7 +118,7 @@ public class ReactNativeMapboxGLView extends RelativeLayout implements
     public void onDrop() {
         if (_mapView == null) { return; }
         _manager.getContext().removeLifecycleEventListener(this);
-        _manager.removeChildListener(this);
+        _mapIsLoading = false;
         if (!_paused) {
             _paused = true;
             _mapView.onPause();
@@ -124,13 +130,25 @@ public class ReactNativeMapboxGLView extends RelativeLayout implements
     @Override
     public void onHostResume() {
         _paused = false;
-        _mapView.onResume();
+        /*
+            Although we have removed ourselves as event listener,
+            when we set _mapView = null,
+            sometimes event gets stuck in the event queue and onHostResume
+            is called even if removeEventListener is called before it.
+            It happens when we add and remove event listener quickly.
+            That is why we need to check if _mapView is null here.
+         */
+        if (_mapView != null) {
+            _mapView.onResume();
+        }
     }
 
     @Override
     public void onHostPause() {
         _paused = true;
-        _mapView.onPause();
+        if (_mapView != null) {
+            _mapView.onPause();
+        }
     }
 
     @Override
@@ -153,6 +171,11 @@ public class ReactNativeMapboxGLView extends RelativeLayout implements
     public void onMapReady(MapboxMap mapboxMap) {
         if (_mapView == null) { return; }
         _map = mapboxMap;
+        // when DID_FINISH_LOADING change was triggered map could not emit this event,
+        // becase _map was null, now we can emit it.
+        if (_mapLoaded) {
+            emitEvent(ReactNativeMapboxGLEventTypes.ON_FINISH_LOADING_MAP, null);
+        }
 
         // Configure map
         _map.setMyLocationEnabled(_showsUserLocation);
@@ -210,6 +233,7 @@ public class ReactNativeMapboxGLView extends RelativeLayout implements
 
     private void destroyMapView() {
         _mapView.removeOnMapChangedListener(this);
+        _mapLoaded = false;
         if (_map != null) {
             _map.setOnMapClickListener(null);
             _map.setOnMapLongClickListener(null);
@@ -226,21 +250,61 @@ public class ReactNativeMapboxGLView extends RelativeLayout implements
     // Children
 
     @Override
-    public void childAdded(View child) {
-        if (child instanceof RNMGLAnnotationView) {
+    public void addView(View child, int index) {
+        _childViews.add(index, child);
+        if (RNMGLAnnotationView.class.equals(child.getClass())) {
+            _annotationViews.add((RNMGLAnnotationView)child);
             updateMarkerAnnotations();
+        } else {
+            super.addView(child, getRealIndex(index));
         }
+    }
+
+    public int getChildCountReactInternal() {
+        return _childViews.size();
+    }
+
+    public View getChildAtReactInternal(int index) {
+        return _childViews.get(index);
     }
 
     @Override
-    public void childRemoved(View child) {
-        if (child instanceof RNMGLAnnotationView) {
+    public void removeViewAt(int index) {
+        int realIndex = getRealIndex(index);
+        View child = _childViews.remove(index);
+        if (RNMGLAnnotationView.class.equals(child.getClass())) {
+            _annotationViews.remove(child);
             updateMarkerAnnotations();
+        } else {
+            super.removeViewAt(realIndex);
         }
     }
 
+    private int getRealIndex(int index) {
+        int annotationViews = 0;
+        for (int i = 0; i < index; i++) {
+            if (RNMGLAnnotationView.class.equals(getChildAtReactInternal(i).getClass())) {
+                annotationViews++;
+            }
+        }
+        return index - annotationViews;
+    }
+
+    public Set<RNMGLAnnotationView> getAnnotationViews() {
+        return _annotationViews;
+    }
+
     private void updateMarkerAnnotations() {
-        Set<RNMGLAnnotationView> newAnnotationViews = new HashSet<>(_manager.getAnnotationViews(this));
+        /*
+            _map obviously must be present, but this method might be called while
+            map is currently in the process of loading, which result in loss of
+            custom marker annotations that should be displayed on map.
+         */
+        if (_mapIsLoading || _map == null) {
+            return;
+        }
+
+        Set<RNMGLAnnotationView> newAnnotationViews = getAnnotationViews();
         Set<RNMGLAnnotationView> currentViews = new HashSet<>(_customAnnotationViewMap.values());
         Collection<RNMGLAnnotationView> addedChildren = Sets.difference(newAnnotationViews, currentViews);
         Collection<RNMGLAnnotationView> removedChildren = Sets.difference(currentViews, newAnnotationViews);
@@ -632,13 +696,19 @@ public class ReactNativeMapboxGLView extends RelativeLayout implements
                 }
                 break;
             case MapView.WILL_START_LOADING_MAP:
-                _manager.removeChildListener(this);
+                _mapIsLoading = true;
                 emitEvent(ReactNativeMapboxGLEventTypes.ON_START_LOADING_MAP, null);
                 break;
             case MapView.DID_FINISH_LOADING_MAP:
-                _manager.addChildListener(this);
+                _mapIsLoading = false;
+                _mapLoaded = true;
                 updateMarkerAnnotations();
-                emitEvent(ReactNativeMapboxGLEventTypes.ON_FINISH_LOADING_MAP, null);
+                // We should not inform user about map finished loading,
+                // if we are not ready internally (we didn't get _map reference).
+                // User will be informed when onMapReady is called.
+                if (_map != null) {
+                    emitEvent(ReactNativeMapboxGLEventTypes.ON_FINISH_LOADING_MAP, null);
+                }
                 break;
         }
     }
@@ -682,7 +752,12 @@ public class ReactNativeMapboxGLView extends RelativeLayout implements
     }
 
     public LatLngBounds getBounds() {
-        if (_map == null) { return new LatLngBounds.Builder().build(); }
+        if (_map == null) {
+            throw new JSApplicationIllegalArgumentException(
+                    "Calling getBounds is not allowed until map is ready. " +
+                    "Pass function as onFinishLoadingMap prop to get notified " +
+                    "when map is ready.");
+        }
         return _map.getProjection().getVisibleRegion().latLngBounds;
     }
 
